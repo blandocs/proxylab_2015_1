@@ -27,11 +27,10 @@ ssize_t Rio_readn_w(int fd, void *ptr, size_t nbytes);
 ssize_t Rio_readlineb_w(rio_t *rp, void *usrbuf, size_t maxlen);
 void Rio_writen_w(int fd, void *usrbuf, size_t n);
 
-//semaphore
-sem_t mutex;
-char *client_ip;
-int c_port;
-int bytecount;
+//my global variable
+sem_t mutex; //semaphore for concurrent programming
+char *haddrp; //client's ip
+int client_port; //client's port 
 /*
  * main - Main routine for the proxy program
  */
@@ -51,30 +50,26 @@ int main(int argc, char **argv)
 	int clientlen=sizeof(clientaddr);
 	pthread_t tid;
 
+	//Listen!
 	int listenfd = Open_listenfd(port);
  
 	while (1) {
 		int *connfdp = Malloc(sizeof(int));
 		struct hostent *hp;
-		char *haddrp;
-		int client_port;
 
 		*connfdp = Accept(listenfd, (SA *) &clientaddr, &clientlen);
 		/* determine the domain name and IP address of the client */
+		
+		//It should protect the value referenced by pointer from other threads
+		P(&mutex); /////////////sema 1 wait
+		
 		hp = Gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, sizeof(clientaddr.sin_addr.s_addr), AF_INET);
 		haddrp = inet_ntoa(clientaddr.sin_addr);
-		
-		client_ip = haddrp;
-		
 		client_port = ntohs(clientaddr.sin_port);
-
-		c_port = client_port;
 
 		printf("Server connected to %s (%s), port %d\n",
 		hp->h_name, haddrp, client_port);
 		Pthread_create(&tid, NULL, process_request, connfdp);
-
-		
 	}
 
 	 
@@ -82,12 +77,18 @@ int main(int argc, char **argv)
 }
 
 void *process_request(void* vargp){
+	char *client_ip = haddrp;
+	int c_port = client_port;
 
+	int bytecount = 0;
 	char prefix[40];
 	pthread_t tid = pthread_self();
 	int connfd = *((int *)vargp);
 	Pthread_detach(pthread_self());
 	Free(vargp);
+	
+	//after finish give value from global variables to local variables and give value from pointer to local variables. Now I can post!
+	V(&mutex); /////////////////////sema 1 post
 
 	printf("Served by thread %d\n", (int) tid);
 	sprintf(prefix, "Thread %d ", (int) tid);
@@ -98,17 +99,19 @@ void *process_request(void* vargp){
 
 	Rio_readinitb(&rio, connfd);
 
-	//for split input
+	//variables for or split input
 
 	char *input;
 	char hostname[MAXLINE];
 	char port[MAXLINE];
 	char message[MAXLINE];
 	
+	//initialize count from each socket
 	bytecount = 0;
 
-	while((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0) {
+	while((n = Rio_readlineb_w(&rio, buf, MAXLINE)) != 0) {
 		//split command
+		//Is the count of argument is 3? and so on..
 		input = buf;
 		printf("buf: %s \n",buf);
 		if(strchr(input,' ') != NULL){
@@ -119,21 +122,21 @@ void *process_request(void* vargp){
 					printf("good input\n");
 				else{
 			strcpy(buf, "proxy usage: <host> <port> <message>\n");
-			Rio_writen(connfd, buf, strlen(buf));
+			Rio_writen_w(connfd, buf, strlen(buf));
 			continue;
 
 				}
 			}
 			else{
 			strcpy(buf, "proxy usage: <host> <port> <message>\n");
-			Rio_writen(connfd, buf, strlen(buf));
+			Rio_writen_w(connfd, buf, strlen(buf));
 			continue;
 
 			}
 
 		}else{
 			strcpy(buf, "proxy usage: <host> <port> <message>\n");
-			Rio_writen(connfd, buf, strlen(buf));
+			Rio_writen_w(connfd, buf, strlen(buf));
 			continue;
 
 		}
@@ -141,38 +144,51 @@ void *process_request(void* vargp){
 		
 		//get arguments from client
 		input = buf;
-	
+
+		//set hostname
 		strncpy(hostname,input,strlen(input) - strlen(strchr(input,' ')));
 
-		input = strchr(input, ' ');
-	
+		input = strchr(input, ' ');	
 		input += 1;
+
+		//set port
 		strncpy(port,input,strlen(input) - strlen(strchr(input,' ')));
-	
 		input = strchr(input, ' ');
-	
+
+		//set message
 		strcpy(message,input + 1);
 
 		printf("%sreceived %d bytes \n", prefix, (int) n);
 		
 		printf("%s %s %s\n",hostname,port,message);
 
-		//connect to server
+		/////////////////////
+		//connect to server//
+		/////////////////////
 		rio_t rio2;
 		int clientfd;
 
+
 		clientfd = open_clientfd_ts(hostname,atoi(port), &mutex);
+		if(clientfd < 0){
+			strcpy(buf, "proxy usage: <host> <port> <message>\n");
+			Rio_writen_w(connfd, buf, strlen(buf));
+			continue;
+			Pthread_exit(NULL);
+		}
+		printf("%d\n",clientfd);
 		Rio_readinitb(&rio2, clientfd);
+		Rio_writen_w(clientfd, message, strlen(message));
+		n =	Rio_readlineb_w(&rio2, message, MAXLINE);
+		bytecount += (n-1); //it contains '/n' so minus 1!
+		Rio_writen_w(connfd, message, n);
 
-		Rio_writen(clientfd, message, strlen(message));
-		n =	Rio_readlineb(&rio2, message, MAXLINE);
-		bytecount += n; 
-		Rio_writen(connfd, message, n);
-
+		//protect file from other thread while writing
+		P(&mutex); ///////////////////sema 2 wait
 
 		//Make log file
 		FILE* fd;
-		fd = Fopen("proxy.log","a");
+		fd = Fopen("proxy.log","a"); //append
 		
 		//get current time
 		char answer[MAXLINE];
@@ -242,11 +258,14 @@ void *process_request(void* vargp){
 		case 12:
 			month = "DEC";
 		}
-
+		
 		sprintf(answer, "%s %d %s %d %d:%d:%d KST: %s %d %d %s",day,t->tm_mday,month,t->tm_year+1900,t->tm_hour,t->tm_min,t->tm_sec,client_ip,c_port,bytecount, message);
 
+		//write date and ip and port .. to proxy.log file
 		Fwrite(answer,1,strlen(answer),fd);
 		Fclose(fd);
+
+		V(&mutex); ////////////////////////sema 2 post
 
 		Close(clientfd);
 		
@@ -256,16 +275,25 @@ void *process_request(void* vargp){
 }
 
 int open_clientfd_ts(char *hostname, int port, sem_t *mutexp){
+	//same to open_clientfd except semaphore
+	//protect this functions by other threads referencing
+	
+	P(mutexp);
   int clientfd;
   struct hostent *hp;
   struct sockaddr_in serveraddr;
 	
-	if ((clientfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+	if ((clientfd = socket(AF_INET, SOCK_STREAM, 0)) < 0){
+		V(mutexp);
 		return -1; /* check errno for cause of error */
+	}
+	
 
   /* Fill in the server's IP address and port */
-  if ((hp = gethostbyname(hostname)) == NULL)
+  if ((hp = gethostbyname(hostname)) == NULL){
+		V(mutexp);
 		return -2; /* check h_errno for cause of error */
+	}
   bzero((char *) &serveraddr, sizeof(serveraddr));
   serveraddr.sin_family = AF_INET;
   bcopy((char *)hp->h_addr_list[0],
@@ -273,8 +301,12 @@ int open_clientfd_ts(char *hostname, int port, sem_t *mutexp){
   serveraddr.sin_port = htons(port);
 
   /* Establish a connection with the server */
-	if (connect(clientfd, (SA *) &serveraddr, sizeof(serveraddr)) < 0)
+	if (connect(clientfd, (SA *) &serveraddr, sizeof(serveraddr)) < 0){
+		V(mutexp);
 		return -1;
+	}
+
+	V(mutexp);
   return clientfd;
 }
 
