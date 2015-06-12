@@ -39,6 +39,9 @@ int main(int argc, char **argv)
 	//semaphore initialize
 	Sem_init(&mutex,0,1);
 
+	//ignore SIGPIPE
+	Signal(SIGPIPE, SIG_IGN);
+
     /* Check arguments */
   if (argc != 2) {
     fprintf(stderr, "Usage: %s <port number>\n", argv[0]);
